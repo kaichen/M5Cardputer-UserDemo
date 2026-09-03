@@ -11,6 +11,7 @@
 #include <apps/utils/theme.h>
 #include <mooncake_log.h>
 #include <driver/gpio.h>
+#include <hal/gpio_ll.h>
 #include <assets.h>
 #include <hal.h>
 
@@ -145,10 +146,12 @@ void AppGamepad::onClose()
 void AppGamepad::bus_init()
 {
     M5.Ex_I2C.begin();
-    // Keep the I2C open-drain outputs but make sure input is enabled so the
-    // line levels can be sampled for the Dual Button.
-    gpio_set_direction(GROVE_PIN_SCL, GPIO_MODE_INPUT_OUTPUT_OD);
-    gpio_set_direction(GROVE_PIN_SDA, GPIO_MODE_INPUT_OUTPUT_OD);
+    // Make sure the pad input buffer is enabled so gpio_get_level() reflects the
+    // real line level for Dual Button detection. Do NOT use gpio_set_direction()
+    // here: it re-routes the pin output to plain GPIO and detaches the I2C
+    // peripheral from the pins.
+    gpio_ll_input_enable(&GPIO, GROVE_PIN_SCL);
+    gpio_ll_input_enable(&GPIO, GROVE_PIN_SDA);
     gpio_pullup_en(GROVE_PIN_SCL);
     gpio_pullup_en(GROVE_PIN_SDA);
 }
