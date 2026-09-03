@@ -11,7 +11,6 @@
 #include <apps/utils/theme.h>
 #include <mooncake_log.h>
 #include <driver/gpio.h>
-#include <hal/gpio_ll.h>
 #include <assets.h>
 #include <hal.h>
 
@@ -27,7 +26,7 @@ static constexpr uint8_t JOY_I2C_ADDR       = 0x63;
 static constexpr uint8_t JOY_REG_ADC_16BITS = 0x00;  // uint16 x, uint16 y, little endian, 0 ~ 65535
 static constexpr uint8_t JOY_REG_BUTTON     = 0x20;  // 0 = pressed
 static constexpr uint8_t JOY_REG_RGB        = 0x30;  // uint32 0x00RRGGBB
-static constexpr uint32_t JOY_I2C_FREQ      = 400000;
+static constexpr uint32_t JOY_I2C_FREQ      = 100000;
 static constexpr int JOY_CENTER             = 32768;
 static constexpr int JOY_DEAD_ZONE          = 12000;  // Stick must leave center by this much to count as a direction
 // Flip these if your stick directions look mirrored on screen
@@ -37,8 +36,6 @@ static constexpr bool JOY_INVERT_Y = false;
 static constexpr uint32_t UPDATE_INTERVAL_MS = 20;
 static constexpr uint32_t PROBE_INTERVAL_MS  = 2000;
 static constexpr int I2C_FAIL_LIMIT          = 5;
-// A Dual Button press must hold the line low for this many samples (filters I2C clock stretching)
-static constexpr uint8_t DUAL_BTN_DEBOUNCE = 2;
 
 /* --------------------------------- Colors --------------------------------- */
 static constexpr uint32_t COLOR_BODY        = 0xC8C4BC;
@@ -50,7 +47,6 @@ static constexpr uint32_t COLOR_BTN         = 0xB02020;
 static constexpr uint32_t COLOR_BTN_ACTIVE  = 0xFF6060;
 static constexpr uint32_t COLOR_PILL        = 0x333333;
 static constexpr uint32_t COLOR_TEXT_DIM    = 0x9A9A9A;
-static constexpr uint32_t COLOR_TEXT_OFF    = 0x666666;
 
 AppGamepad::AppGamepad()
 {
@@ -71,18 +67,8 @@ void AppGamepad::onOpen()
     GetHAL().canvas.setFont(&fonts::Font0);
     GetHAL().canvas.setTextSize(1);
 
-    _state            = PadState_t();
-    _joystick_present = false;
-    _joystick_button  = false;
-    _dual_btn_blue    = false;
-    _dual_btn_red     = false;
-    _blue_low_count   = 0;
-    _red_low_count    = 0;
-    _i2c_fail_count   = 0;
-    _joy_led_on       = false;
-
-    bus_init();
-    probe_joystick();
+    _mode = Mode::None;
+    detect_unit();
     render();
 }
 
@@ -91,34 +77,26 @@ void AppGamepad::onRunning()
     if (GetHAL().millis() - _last_update_time >= UPDATE_INTERVAL_MS) {
         _last_update_time = GetHAL().millis();
 
-        // Dual Button shares the I2C lines; only talk I2C while both lines are released
-        bool bus_held_low = read_dual_button();
-
-        if (!bus_held_low) {
-            if (_joystick_present) {
-                if (read_joystick()) {
-                    _i2c_fail_count = 0;
-                    // Light the stick LED while its button is held
-                    if (_joystick_button != _joy_led_on) {
-                        _joy_led_on = _joystick_button;
-                        set_joystick_led(_joy_led_on ? 0x00FF3030 : 0x00000000);
-                    }
-                } else if (++_i2c_fail_count >= I2C_FAIL_LIMIT) {
-                    mclog::tagWarn(getAppInfo().name, "joystick lost");
-                    _joystick_present = false;
-                    _joystick_button  = false;
-                    _joy_led_on       = false;
-                    _state.raw_x = _state.raw_y = JOY_CENTER;
-                    _state.up = _state.down = _state.left = _state.right = false;
-                    _last_probe_time = GetHAL().millis();
+        if (_mode == Mode::Joystick2) {
+            if (read_joystick()) {
+                _i2c_fail_count = 0;
+                // Light the stick LED while its button is held
+                if (_state.a != _joy_led_on) {
+                    _joy_led_on = _state.a;
+                    set_joystick_led(_joy_led_on ? 0x00FF3030 : 0x00000000);
                 }
-            } else if (GetHAL().millis() - _last_probe_time >= PROBE_INTERVAL_MS) {
-                probe_joystick();
+            } else if (++_i2c_fail_count >= I2C_FAIL_LIMIT) {
+                mclog::tagWarn(getAppInfo().name, "joystick lost, re-detecting");
+                detect_unit();
+            }
+        } else {
+            read_dual_button();
+            // Hot-plug: retry joystick probe while no button is held
+            bool idle = !_state.a && !_state.b;
+            if (idle && GetHAL().millis() - _last_probe_time >= PROBE_INTERVAL_MS) {
+                detect_unit();
             }
         }
-
-        _state.a = _joystick_button || _dual_btn_red;
-        _state.b = _dual_btn_blue;
 
         render();
     }
@@ -134,46 +112,77 @@ void AppGamepad::onClose()
 {
     mclog::tagInfo(getAppInfo().name, "on close");
 
-    if (_joystick_present && !read_dual_button()) {
+    if (_mode == Mode::Joystick2) {
         set_joystick_led(0x00000000);
+        M5.Ex_I2C.release();
+    } else if (_mode == Mode::DualButton) {
+        stop_dual_button();
     }
-    M5.Ex_I2C.release();
+    _mode = Mode::None;
 }
 
 /* -------------------------------------------------------------------------- */
 /*                                 Unit access                                */
 /* -------------------------------------------------------------------------- */
-void AppGamepad::bus_init()
+void AppGamepad::detect_unit()
 {
-    M5.Ex_I2C.begin();
-    // Make sure the pad input buffer is enabled so gpio_get_level() reflects the
-    // real line level for Dual Button detection. Do NOT use gpio_set_direction()
-    // here: it re-routes the pin output to plain GPIO and detaches the I2C
-    // peripheral from the pins.
-    gpio_ll_input_enable(&GPIO, GROVE_PIN_SCL);
-    gpio_ll_input_enable(&GPIO, GROVE_PIN_SDA);
-    gpio_pullup_en(GROVE_PIN_SCL);
-    gpio_pullup_en(GROVE_PIN_SDA);
+    if (_mode == Mode::DualButton) {
+        stop_dual_button();
+    }
+
+    _state           = PadState_t();
+    _i2c_fail_count  = 0;
+    _joy_led_on      = false;
+    _last_probe_time = GetHAL().millis();
+
+    if (probe_joystick()) {
+        if (_mode != Mode::Joystick2) {
+            mclog::tagInfo(getAppInfo().name, "unit joystick2 found at 0x{:02X}", JOY_I2C_ADDR);
+        }
+        _mode = Mode::Joystick2;
+        return;
+    }
+
+    M5.Ex_I2C.release();
+    start_dual_button();
+    if (_mode != Mode::DualButton) {
+        mclog::tagInfo(getAppInfo().name, "no joystick, dual button mode on G{}/G{}", (int)GROVE_PIN_SCL,
+                       (int)GROVE_PIN_SDA);
+    }
+    _mode = Mode::DualButton;
 }
 
-void AppGamepad::probe_joystick()
+bool AppGamepad::probe_joystick()
 {
-    _last_probe_time  = GetHAL().millis();
-    _i2c_fail_count   = 0;
-    _joystick_present = M5.Ex_I2C.scanID(JOY_I2C_ADDR);
-    if (_joystick_present) {
-        mclog::tagInfo(getAppInfo().name, "unit joystick2 found at 0x{:02X}", JOY_I2C_ADDR);
+    if (!M5.Ex_I2C.begin()) {
+        return false;
     }
+    return M5.Ex_I2C.scanID(JOY_I2C_ADDR);
+}
+
+// Register read with a STOP between the address write and the data read,
+// the most tolerant sequence for STM32-based M5 units.
+static bool joy_read_reg(uint8_t reg, uint8_t* buf, size_t len)
+{
+    auto& i2c = M5.Ex_I2C;
+    bool ok   = i2c.start(JOY_I2C_ADDR, false, JOY_I2C_FREQ) && i2c.write(reg);
+    ok        = i2c.stop() && ok;
+    if (!ok) {
+        return false;
+    }
+    ok = i2c.start(JOY_I2C_ADDR, true, JOY_I2C_FREQ) && i2c.read(buf, len, true);
+    ok = i2c.stop() && ok;
+    return ok;
 }
 
 bool AppGamepad::read_joystick()
 {
     uint8_t adc[4];
-    if (!M5.Ex_I2C.readRegister(JOY_I2C_ADDR, JOY_REG_ADC_16BITS, adc, sizeof(adc), JOY_I2C_FREQ)) {
+    if (!joy_read_reg(JOY_REG_ADC_16BITS, adc, sizeof(adc))) {
         return false;
     }
     uint8_t btn;
-    if (!M5.Ex_I2C.readRegister(JOY_I2C_ADDR, JOY_REG_BUTTON, &btn, 1, JOY_I2C_FREQ)) {
+    if (!joy_read_reg(JOY_REG_BUTTON, &btn, 1)) {
         return false;
     }
 
@@ -185,11 +194,12 @@ bool AppGamepad::read_joystick()
     if (JOY_INVERT_X) dx = -dx;
     if (JOY_INVERT_Y) dy = -dy;
 
-    _state.left      = dx < -JOY_DEAD_ZONE;
-    _state.right     = dx > JOY_DEAD_ZONE;
-    _state.up        = dy < -JOY_DEAD_ZONE;
-    _state.down      = dy > JOY_DEAD_ZONE;
-    _joystick_button = (btn == 0);
+    _state.left  = dx < -JOY_DEAD_ZONE;
+    _state.right = dx > JOY_DEAD_ZONE;
+    _state.up    = dy < -JOY_DEAD_ZONE;
+    _state.down  = dy > JOY_DEAD_ZONE;
+    _state.a     = (btn == 0);
+    _state.b     = false;
     return true;
 }
 
@@ -199,19 +209,28 @@ void AppGamepad::set_joystick_led(uint32_t rgb)
     M5.Ex_I2C.writeRegister(JOY_I2C_ADDR, JOY_REG_RGB, data, sizeof(data), JOY_I2C_FREQ);
 }
 
-bool AppGamepad::read_dual_button()
+void AppGamepad::start_dual_button()
 {
-    // Between transactions both I2C lines idle high. A Dual Button press pulls one low.
-    bool scl_low = gpio_get_level(GROVE_PIN_SCL) == 0;
-    bool sda_low = gpio_get_level(GROVE_PIN_SDA) == 0;
+    gpio_config_t io_conf = {};
+    io_conf.pin_bit_mask  = (1ULL << GROVE_PIN_SCL) | (1ULL << GROVE_PIN_SDA);
+    io_conf.mode          = GPIO_MODE_INPUT;
+    io_conf.pull_up_en    = GPIO_PULLUP_ENABLE;
+    io_conf.pull_down_en  = GPIO_PULLDOWN_DISABLE;
+    io_conf.intr_type     = GPIO_INTR_DISABLE;
+    gpio_config(&io_conf);
+}
 
-    _blue_low_count = scl_low ? std::min<uint8_t>(_blue_low_count + 1, DUAL_BTN_DEBOUNCE) : 0;
-    _red_low_count  = sda_low ? std::min<uint8_t>(_red_low_count + 1, DUAL_BTN_DEBOUNCE) : 0;
+void AppGamepad::stop_dual_button()
+{
+    gpio_reset_pin(GROVE_PIN_SCL);
+    gpio_reset_pin(GROVE_PIN_SDA);
+}
 
-    _dual_btn_blue = _blue_low_count >= DUAL_BTN_DEBOUNCE;
-    _dual_btn_red  = _red_low_count >= DUAL_BTN_DEBOUNCE;
-
-    return scl_low || sda_low;
+void AppGamepad::read_dual_button()
+{
+    // Pressed = LOW
+    _state.b = gpio_get_level(GROVE_PIN_SCL) == 0;
+    _state.a = gpio_get_level(GROVE_PIN_SDA) == 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -244,20 +263,19 @@ void AppGamepad::render_header()
 {
     auto& c = GetHAL().canvas;
     c.setTextDatum(top_left);
+    c.setTextColor(THEME_COLOR_SYSTEM_BAR);
 
-    // Joystick status (left)
-    if (_joystick_present) {
-        c.setTextColor(THEME_COLOR_SYSTEM_BAR);
-        c.drawString(fmt::format("JOY X:{:5d} Y:{:5d}", _state.raw_x, _state.raw_y).c_str(), 2, 2);
+    if (_mode == Mode::Joystick2) {
+        c.drawString("JOYSTICK2", 2, 2);
+        c.setTextColor(COLOR_TEXT_DIM);
+        c.setTextDatum(top_right);
+        c.drawString(fmt::format("X:{:5d} Y:{:5d}", _state.raw_x, _state.raw_y).c_str(), 202, 2);
     } else {
-        c.setTextColor(COLOR_TEXT_OFF);
-        c.drawString("JOY: not found", 2, 2);
+        c.drawString("DUAL BUTTON", 2, 2);
+        c.setTextColor(COLOR_TEXT_DIM);
+        c.setTextDatum(top_right);
+        c.drawString("BLUE=B RED=A", 202, 2);
     }
-
-    // Dual Button mapping (right)
-    c.setTextDatum(top_right);
-    c.setTextColor(COLOR_TEXT_DIM);
-    c.drawString("BLUE=B RED=A", 202, 2);
     c.setTextDatum(top_left);
 }
 
@@ -319,7 +337,7 @@ void AppGamepad::render_center(int cx, int cy)
     c.fillRoundRect(cx - 15, cy + 20, 12, 6, 3, COLOR_PILL);
     c.fillRoundRect(cx + 3, cy + 20, 12, 6, 3, COLOR_PILL);
 
-    if (_joystick_present) {
+    if (_mode == Mode::Joystick2) {
         // Analog stick position indicator
         constexpr int ring = 14;
         c.drawCircle(cx, cy - 6, ring, COLOR_PILL);

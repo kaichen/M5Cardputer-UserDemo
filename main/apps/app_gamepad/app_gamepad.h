@@ -10,13 +10,12 @@
 /**
  * @brief FC-style gamepad demo for Grove units on the Grove port (G1 = SCL, G2 = SDA).
  *
- * Both units may be connected at the same time through a Grove hub:
+ * One unit at a time, auto detected and hot-swappable:
  *  - Unit Joystick2 (I2C 0x63): stick -> D-pad, stick button -> A
  *  - Unit Dual Button (GPIO):   blue (G1) -> B, red (G2) -> A
  *
- * The bus stays in I2C mode. A Dual Button press pulls SCL or SDA low, which is
- * detected by sampling the pin levels between I2C transactions. While a line is
- * held low the joystick is not polled.
+ * The two units cannot share the port through a Grove hub: Dual Button has a 100 nF
+ * debounce capacitor on each signal line, which kills I2C edges.
  */
 class AppGamepad : public mooncake::AppAbility {
 public:
@@ -28,6 +27,8 @@ public:
     void onClose() override;
 
 private:
+    enum class Mode { None, Joystick2, DualButton };
+
     struct PadState_t {
         bool up    = false;
         bool down  = false;
@@ -40,23 +41,20 @@ private:
         int raw_y = 32768;
     };
 
+    Mode _mode = Mode::None;
     PadState_t _state;
-    bool _joystick_present     = false;
-    bool _joystick_button      = false;
-    bool _dual_btn_blue        = false;
-    bool _dual_btn_red         = false;
-    uint8_t _blue_low_count    = 0;
-    uint8_t _red_low_count     = 0;
     uint32_t _last_update_time = 0;
     uint32_t _last_probe_time  = 0;
     int _i2c_fail_count        = 0;
     bool _joy_led_on           = false;
 
-    void bus_init();
-    void probe_joystick();
+    void detect_unit();
+    bool probe_joystick();
     bool read_joystick();
     void set_joystick_led(uint32_t rgb);
-    bool read_dual_button();  // returns true if any line is held low
+    void start_dual_button();
+    void stop_dual_button();
+    void read_dual_button();
 
     void render();
     void render_header();
